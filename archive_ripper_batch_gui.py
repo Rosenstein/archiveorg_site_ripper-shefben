@@ -358,6 +358,10 @@ class BatchRipperWorker(QtCore.QThread):
                 if not save_path:
                     output_dir = "output"
                     savename = None
+                elif save_path.endswith('/') or save_path.endswith('\\') or os.path.isdir(save_path):
+                    # Treat as output directory, no custom filename
+                    output_dir = save_path.rstrip('/\\') or "output"
+                    savename = None
                 else:
                     output_dir = os.path.dirname(save_path) or "output"
                     savename = os.path.basename(save_path)
@@ -421,6 +425,10 @@ class BatchMainWindow(QtWidgets.QWidget):
         self.add_btn.clicked.connect(self.add_job)
         btn_layout.addWidget(self.add_btn)
 
+        self.load_btn = QtWidgets.QPushButton("Load from File")
+        self.load_btn.clicked.connect(self.load_urls_from_file)
+        btn_layout.addWidget(self.load_btn)
+
         self.exec_btn = QtWidgets.QPushButton("Execute")
         self.exec_btn.clicked.connect(self.execute_jobs)
         btn_layout.addWidget(self.exec_btn)
@@ -452,6 +460,43 @@ class BatchMainWindow(QtWidgets.QWidget):
     def open_era_dialog(self):
         dialog = EraRipDialog(self)
         dialog.exec_()
+
+    def load_urls_from_file(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Load URLs from text file",
+            "",
+            "Text Files (*.txt);;All Files (*)",
+        )
+        if not path:
+            return
+
+        count = 0
+        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                # Format: TIMESTAMP URL HASH (space-separated)
+                parts = line.split()
+                if len(parts) < 2:
+                    continue
+                timestamp = parts[0]
+                original_url = parts[1]
+                url = f"https://web.archive.org/web/{timestamp}id_/{original_url}"
+                job = {"url": url, "save_path": ""}
+                self.jobs.append(job)
+                self.queue_list.addItem(url)
+                count += 1
+
+        if count:
+            QtWidgets.QMessageBox.information(
+                self, "Loaded", f"Added {count} URL(s) from file."
+            )
+        else:
+            QtWidgets.QMessageBox.warning(
+                self, "Empty", "No URLs found in the selected file."
+            )
 
     def add_job(self):
         url = self.url_edit.text().strip()
@@ -500,6 +545,7 @@ class BatchMainWindow(QtWidgets.QWidget):
 
     def _set_ui_running_state(self, running: bool):
         self.add_btn.setEnabled(not running)
+        self.load_btn.setEnabled(not running)
         self.exec_btn.setEnabled(not running)
         self.era_btn.setEnabled(not running)
         # Cancel just closes window; leaving it disabled while a job is
