@@ -11,6 +11,7 @@ from PyQt5 import QtWidgets, QtCore
 from archive_ripper import (
     run_ripper, focus_console_window, session, fetch_url, save_file,
     make_archive_url, log, RATE_LIMIT, TEXT_EXTS, strip_archive_comments,
+    parse_archive_url, compute_local_path,
 )
 
 
@@ -339,32 +340,68 @@ class EraRipDialog(QtWidgets.QDialog):
 class BatchRipperWorker(QtCore.QThread):
     job_started = QtCore.pyqtSignal(int, str, str)   # index, url, save_path
     job_finished = QtCore.pyqtSignal(int, str)       # index, final_page
+    job_skipped = QtCore.pyqtSignal(int, str)        # index, reason
     job_error = QtCore.pyqtSignal(int, str)          # index, error_message
-    all_done = QtCore.pyqtSignal()
+    all_done = QtCore.pyqtSignal(list)               # list of failed job dicts
 
     def __init__(self, jobs, parent=None):
         super().__init__(parent)
         # jobs is a list of dicts: {"url": ..., "save_path": ...}
         self.jobs = jobs
+        self.failed_jobs = []
+
+    def _resolve_output(self, save_path):
+        """Return (output_dir, savename) for a given save_path."""
+        if not save_path:
+            return "output", None
+        if save_path.endswith('/') or save_path.endswith('\\') or os.path.isdir(save_path):
+            return save_path.rstrip('/\\') or "output", None
+        return os.path.dirname(save_path) or "output", os.path.basename(save_path)
+
+    def _already_exists(self, url, output_dir, savename):
+        """Check if the output file for this URL already exists on disk."""
+        try:
+            _ts, original_url = parse_archive_url(url)
+        except ValueError:
+            return False
+
+        # Check the path run_ripper would produce (with .html appended)
+        local_page = compute_local_path(output_dir, original_url, add_ext=True)
+        if os.path.exists(local_page):
+            return True
+
+        # Also check without .html extension
+        local_plain = compute_local_path(output_dir, original_url)
+        if os.path.exists(local_plain):
+            return True
+
+        # If a custom savename was given, check that too
+        if savename:
+            page_dir = os.path.dirname(local_page)
+            root, ext = os.path.splitext(savename)
+            if not ext:
+                ext = os.path.splitext(local_page)[1] or '.html'
+            final_path = os.path.join(page_dir, root + ext)
+            if os.path.exists(final_path):
+                return True
+
+        return False
 
     def run(self):
-        # Process each job sequentially
+        self.failed_jobs = []
+
         for idx, job in enumerate(self.jobs):
             url = job["url"]
             save_path = job["save_path"]
+            output_dir, savename = self._resolve_output(save_path)
+
+            # Skip if already downloaded
+            if self._already_exists(url, output_dir, savename):
+                self.job_skipped.emit(idx, "already exists on disk")
+                continue
+
             try:
                 self.job_started.emit(idx, url, save_path)
-
-                if not save_path:
-                    output_dir = "output"
-                    savename = None
-                elif save_path.endswith('/') or save_path.endswith('\\') or os.path.isdir(save_path):
-                    # Treat as output directory, no custom filename
-                    output_dir = save_path.rstrip('/\\') or "output"
-                    savename = None
-                else:
-                    output_dir = os.path.dirname(save_path) or "output"
-                    savename = os.path.basename(save_path)
 
                 page = run_ripper(
                     url=url,
@@ -376,7 +413,9 @@ class BatchRipperWorker(QtCore.QThread):
                 self.job_finished.emit(idx, page)
             except Exception as e:
                 self.job_error.emit(idx, str(e))
-        self.all_done.emit()
+                self.failed_jobs.append(job)
+
+        self.all_done.emit(self.failed_jobs)
 
 
 class BatchMainWindow(QtWidgets.QWidget):
@@ -538,6 +577,7 @@ class BatchMainWindow(QtWidgets.QWidget):
         self.worker = BatchRipperWorker(jobs_copy, self)
         self.worker.job_started.connect(self.on_job_started)
         self.worker.job_finished.connect(self.on_job_finished)
+        self.worker.job_skipped.connect(self.on_job_skipped)
         self.worker.job_error.connect(self.on_job_error)
         self.worker.all_done.connect(self.on_all_done)
         self.worker.finished.connect(self.on_worker_finished)
@@ -576,20 +616,55 @@ class BatchMainWindow(QtWidgets.QWidget):
                 base_text = base_text.split("] ", 1)[-1]
             item.setText(f"[DONE] {base_text}")
 
+    def on_job_skipped(self, index: int, reason: str):
+        if 0 <= index < self.queue_list.count():
+            item = self.queue_list.item(index)
+            base_text = item.text()
+            if base_text.startswith(("[DONE] ", "[ERROR] ", "[RUNNING] ", "[SKIPPED] ")):
+                base_text = base_text.split("] ", 1)[-1]
+            item.setText(f"[SKIPPED] {base_text}")
+
     def on_job_error(self, index: int, message: str):
         if 0 <= index < self.queue_list.count():
             item = self.queue_list.item(index)
             base_text = item.text()
-            if base_text.startswith("[DONE] ") or base_text.startswith("[ERROR] ") or base_text.startswith("[RUNNING] "):
+            if base_text.startswith(("[DONE] ", "[ERROR] ", "[RUNNING] ", "[SKIPPED] ")):
                 base_text = base_text.split("] ", 1)[-1]
             item.setText(f"[ERROR] {base_text}  ({message})")
 
-    def on_all_done(self):
-        QtWidgets.QMessageBox.information(
-            self,
-            "Batch complete",
-            "All queued jobs have finished.\n\nCheck the console window for full logs.",
-        )
+    def on_all_done(self, failed_jobs):
+        if failed_jobs:
+            # Save failed jobs to a text file
+            fail_path = os.path.join(os.getcwd(), "failed_rips.txt")
+            with open(fail_path, 'w', encoding='utf-8') as f:
+                for job in failed_jobs:
+                    f.write(f"{job['url']}\n")
+            log(f"Saved {len(failed_jobs)} failed URL(s) to {fail_path}")
+
+            reply = QtWidgets.QMessageBox.question(
+                self,
+                "Batch complete with errors",
+                f"{len(failed_jobs)} job(s) failed.\n"
+                f"Failed URLs saved to:\n{fail_path}\n\n"
+                "Would you like to retry the failed jobs?",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            )
+            if reply == QtWidgets.QMessageBox.Yes:
+                # Replace queue with only the failed jobs and re-run
+                self.jobs = list(failed_jobs)
+                self.queue_list.clear()
+                for job in self.jobs:
+                    self.queue_list.addItem(job["url"])
+                # Small delay so the UI updates before starting
+                QtCore.QTimer.singleShot(100, self.execute_jobs)
+                return
+        else:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Batch complete",
+                "All queued jobs have finished.\n\nCheck the console window for full logs.",
+            )
+
         # Clear the internal queue AND the visible list so user has a fresh batch
         self.jobs.clear()
         self.queue_list.clear()
@@ -635,6 +710,9 @@ class BatchMainWindow(QtWidgets.QWidget):
         self.worker.job_finished.connect(
             lambda idx, page_path, row=row: self.on_single_job_finished(row, page_path)
         )
+        self.worker.job_skipped.connect(
+            lambda idx, reason, row=row: self.on_single_job_skipped(row, reason)
+        )
         self.worker.job_error.connect(
             lambda idx, msg, row=row: self.on_single_job_error(row, msg)
         )
@@ -646,15 +724,26 @@ class BatchMainWindow(QtWidgets.QWidget):
         if 0 <= row < self.queue_list.count():
             item = self.queue_list.item(row)
             base_text = item.text()
-            if base_text.startswith("[DONE] ") or base_text.startswith("[ERROR] ") or base_text.startswith("[RUNNING] "):
+            if base_text.startswith(("[DONE] ", "[ERROR] ", "[RUNNING] ", "[SKIPPED] ")):
                 base_text = base_text.split("] ", 1)[-1]
             item.setText(f"[RUNNING] {base_text}")
+
+    def on_single_job_skipped(self, row: int, reason: str):
+        if 0 <= row < self.queue_list.count():
+            item = self.queue_list.item(row)
+            base_text = item.text()
+            if base_text.startswith(("[DONE] ", "[ERROR] ", "[RUNNING] ", "[SKIPPED] ")):
+                base_text = base_text.split("] ", 1)[-1]
+            item.setText(f"[SKIPPED] {base_text}")
+        QtWidgets.QMessageBox.information(
+            self, "Skipped", f"Job skipped: {reason}",
+        )
 
     def on_single_job_finished(self, row: int, page_path: str):
         if 0 <= row < self.queue_list.count():
             item = self.queue_list.item(row)
             base_text = item.text()
-            if base_text.startswith("[DONE] ") or base_text.startswith("[ERROR] ") or base_text.startswith("[RUNNING] "):
+            if base_text.startswith(("[DONE] ", "[ERROR] ", "[RUNNING] ", "[SKIPPED] ")):
                 base_text = base_text.split("] ", 1)[-1]
             item.setText(f"[DONE] {base_text}")
 
@@ -668,7 +757,7 @@ class BatchMainWindow(QtWidgets.QWidget):
         if 0 <= row < self.queue_list.count():
             item = self.queue_list.item(row)
             base_text = item.text()
-            if base_text.startswith("[DONE] ") or base_text.startswith("[ERROR] ") or base_text.startswith("[RUNNING] "):
+            if base_text.startswith(("[DONE] ", "[ERROR] ", "[RUNNING] ", "[SKIPPED] ")):
                 base_text = base_text.split("] ", 1)[-1]
             item.setText(f"[ERROR] {base_text}  ({message})")
 
